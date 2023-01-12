@@ -359,6 +359,36 @@ func (recorder *recorderImpl) generateEvent(object runtime.Object, annotations m
 	}
 }
 
+func (recorder *recorderImpl) generateEventWithLabels(object runtime.Object, labels map[string]string, eventtype, reason, message string) {
+	ref, err := ref.GetReference(recorder.scheme, object)
+	if err != nil {
+		klog.Errorf("Could not construct reference to: '%#v' due to: '%v'. Will not report event: '%v' '%v' '%v'", object, err, eventtype, reason, message)
+		return
+	}
+
+	if !util.ValidateEventType(eventtype) {
+		klog.Errorf("Unsupported event type: '%v'", eventtype)
+		return
+	}
+
+	event := recorder.makeEventWithLabels(ref, labels, eventtype, reason, message)
+	event.Source = recorder.source
+
+	// NOTE: events should be a non-blocking operation, but we also need to not
+	// put this in a goroutine, otherwise we'll race to write to a closed channel
+	// when we go to shut down this broadcaster.  Just drop events if we get overloaded,
+	// and log an error if that happens (we've configured the broadcaster to drop
+	// outgoing events anyway).
+	sent, err := recorder.ActionOrDrop(watch.Added, event)
+	if err != nil {
+		klog.Errorf("unable to record event: %v (will not retry!)", err)
+		return
+	}
+	if !sent {
+		klog.Errorf("unable to record event: too many queued events, dropped event %#v", event)
+	}
+}
+
 func (recorder *recorderImpl) Event(object runtime.Object, eventtype, reason, message string) {
 	recorder.generateEvent(object, nil, eventtype, reason, message)
 }
@@ -369,6 +399,10 @@ func (recorder *recorderImpl) Eventf(object runtime.Object, eventtype, reason, m
 
 func (recorder *recorderImpl) AnnotatedEventf(object runtime.Object, annotations map[string]string, eventtype, reason, messageFmt string, args ...interface{}) {
 	recorder.generateEvent(object, annotations, eventtype, reason, fmt.Sprintf(messageFmt, args...))
+}
+
+func (recorder *recorderImpl) LabeledEventf(object runtime.Object, labels map[string]string, eventtype, reason, messageFmt string, args ...interface{}) {
+	recorder.generateEventWithLabels(object, labels, eventtype, reason, fmt.Sprintf(messageFmt, args...))
 }
 
 func (recorder *recorderImpl) makeEvent(ref *v1.ObjectReference, annotations map[string]string, eventtype, reason, message string) *v1.Event {
@@ -382,6 +416,28 @@ func (recorder *recorderImpl) makeEvent(ref *v1.ObjectReference, annotations map
 			Name:        fmt.Sprintf("%v.%x", ref.Name, t.UnixNano()),
 			Namespace:   namespace,
 			Annotations: annotations,
+		},
+		InvolvedObject: *ref,
+		Reason:         reason,
+		Message:        message,
+		FirstTimestamp: t,
+		LastTimestamp:  t,
+		Count:          1,
+		Type:           eventtype,
+	}
+}
+
+func (recorder *recorderImpl) makeEventWithLabels(ref *v1.ObjectReference, labels map[string]string, eventtype, reason, message string) *v1.Event {
+	t := metav1.Time{Time: recorder.clock.Now()}
+	namespace := ref.Namespace
+	if namespace == "" {
+		namespace = metav1.NamespaceDefault
+	}
+	return &v1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%v.%x", ref.Name, t.UnixNano()),
+			Namespace: namespace,
+			Labels:    labels,
 		},
 		InvolvedObject: *ref,
 		Reason:         reason,
